@@ -1,0 +1,185 @@
+#!/usr/bin/env node
+"use strict";
+var program = require('commander'),
+	util = require('util'),
+	json = require('../package.json'),
+	texvcjs = require('texvcjs'),
+	fs = require('fs'),
+	kue = require('kue'),
+	_u = require("underscore"),
+	cluster = require('cluster');
+
+var jobs = kue.createQueue();
+
+var CHUNKSIZE = 1000,
+	clusterWorkerSize = require('os').cpus().length;
+//TODO: Better testing for multi-cpu use
+clusterWorkerSize = 1;
+program
+	.version(json.version)
+	.usage('[options] <input file> <output file> <texvccheck binary>' +
+		'in mediawiki vagrant the texvccheck binary is be located in' +
+		'/vagrant/mediawiki/extensions/Math/texvccheck/texvccheck' )
+	.option('-v, --verbose', 'Show verbose error information')
+	.option('-D, --debug', 'Show stack trace on failure')
+	.option('-L, --limit [#n]', 'Process only top n elements');
+// in vagrant the texvccheck binary is be located in
+// /vagrant/mediawiki/extensions/Math/texvccheck/texvccheck
+program.parse(process.argv);
+if (cluster.isMaster) {
+
+	var inFile = require(program.args[0]);
+	var outFile = [],
+		jobPrefix = new Date().getTime().toString();
+	inFile = inFile.slice(0, program.limit);
+	util.print('Processing ' + inFile.length + ' math tags.');
+
+	var scheduledJobs = 0;
+// group them into chunks
+	var mkgroups = function (arr, n) {
+		var result = [], group = [];
+		//var seen = Object.create(null);
+		var assignedWorker = 1;
+		arr.forEach(function (elem) {
+			//if (seen[elem.input]) { return; } else { seen[elem.input] = true; }
+			group.push(elem);
+			if (group.length >= n) {
+				jobs.create(jobPrefix+'groupFor'+assignedWorker, group).save();
+				scheduledJobs++;
+				assignedWorker++;
+				if(assignedWorker>clusterWorkerSize){
+					assignedWorker=1;
+				}
+				group = [];
+			}
+		});
+		if (group.length > 0) {
+			jobs.create(jobPrefix+'groupFor'+assignedWorker, group).save();
+			scheduledJobs++;
+		}
+	};
+//shutdown kue and writes the final output file
+	var shutdown = function () {
+		console.log('[ Shutting down when all jobs finish... ]');
+		var outputFilename = program.args[1];
+		jobs.shutdown(function (err) {
+			console.log('[ All jobs finished. Kue is shut down. ]');
+			fs.writeFile(outputFilename, JSON.stringify(outFile, null, 2), function (err) {
+				if (err) {
+					console.log(err);
+				} else {
+					console.log("JSON saved to " + outputFilename);
+					process.exit(0);
+				}
+			});
+		});
+	};
+
+	mkgroups(inFile, CHUNKSIZE );/// inFile.length /  clusterWorkerSize);
+	if (scheduledJobs === 0) {
+		console.log('[ No jobs scheduled ]');
+		shutdown();
+	} else {
+		console.log('[ ' + scheduledJobs + ' Jobs are scheduled. Kue will shutdown afterwards... ]');
+	}
+	console.log('prefix:'+jobPrefix);
+	kue.app.listen(3000);
+	var new_worker_env = {};
+	new_worker_env['JOB_PREFIX'] = jobPrefix;
+	for (var i = 0; i < clusterWorkerSize; i++) {
+		cluster.fork(new_worker_env);
+
+	}
+	// Count requestes
+	var messageHandler = function (msg) {
+		console.log('got msg with %d new files', msg.length);
+		outFile = _u.union(outFile,msg);
+		if (outFile.length >= inFile.length) {
+			shutdown();
+		}
+		console.log('total %d lengh', outFile.length);
+	};
+
+	Object.keys(cluster.workers).forEach(function(id) {
+		cluster.workers[id].on('message', messageHandler);
+	});
+} else {
+	var outFile = [];
+	var currentChunkCtx,
+		runningJobs = 0,
+		jobPrefix = process.env['JOB_PREFIX'];
+	console.log(jobPrefix);
+	var texvccheck = module.exports.texvccheck = function(input,cb) {
+		var texvcbinary = program.args[2];
+		var t1 = process.hrtime();
+		var formatResult = function (status,output){
+			t1 = process.hrtime(t1);
+			var time = t1[0]*1e9+t1[1];
+			input.texvccheck = {"status": status,
+				"output": output,
+				"time": time};
+			return input;
+		};
+		var getocaml = function(input, fixDoubleSpacing, done) {
+			if (!texvcbinary) { done( formatResult( 'E','-no texvcbinary')) ; }
+			var cp = require('child_process');
+			cp.execFile(texvcbinary, [input], { encoding: 'utf8' }, function(err,stdout,stderr) {
+				if (err) { done( formatResult( 'E','-texvc error ' + err )); }
+				if (stderr) { done( formatResult( 'E','-texvc stderror ' + stderr)); }
+				if (fixDoubleSpacing) { stdout = stdout.replace(/  /g, ' '); }
+				done( formatResult( stdout.charAt(0) , stdout.substring(1)));
+			});
+		};
+		getocaml( input.input, false, cb);
+	};
+	var log = function (msg){ if (program.debug ){util.log(cluster.worker.id+': '+ msg);} };
+	jobs.process(jobPrefix+'groupFor'+cluster.worker.id, 1, function (job, done, ctx) {
+		log('Starting new chunk.');
+		job.data.forEach(function (elem, index, inFile) {
+			var t1 = process.hrtime();
+			elem.texvcjs = texvcjs.check(elem.input);
+			t1 = process.hrtime(t1);
+			elem.texvcjs.time = t1[0] * 1e9 + t1[1];
+			jobs.create(jobPrefix+'texvccheck'+cluster.worker.id, elem).save();
+			scheduledJobs++;
+		});
+		currentChunkCtx = ctx;
+		log( 'Wait for chunk to complete.' );
+		ctx.pause( function(err) { currentChunkCtx = ctx;} );
+		done();
+
+	});
+
+	jobs.process(jobPrefix+'texvccheck'+cluster.worker.id, 5, function (job, done) {
+		//console.log('Starting ' + JSON.stringify(job.data.input));
+		++runningJobs;
+		log('new job ' + runningJobs +'jobs now running' );
+		texvccheck(job.data, function (result) {
+			outFile.push(result);
+			//util.log('submitting result for' + result.input);
+			done();
+		});
+	});
+
+	jobs.on('job complete', function (id, result) {
+		kue.Job.get(id, function (err, job) {
+			if (err) return;
+			job.remove(function (err) {
+				if (err) throw err;
+				if (job.type === jobPrefix+'texvccheck'+cluster.worker.id) {
+					--runningJobs;
+					log('removed completed job '+ job.id);
+					log('Running jobs:' + runningJobs);
+					if (runningJobs === 0) {
+						log('Chunk completed.');
+						log(JSON.stringify(currentChunkCtx));
+						log('Sending results.');
+						process.send(outFile);
+						outFile = [];
+						currentChunkCtx.resume();
+					}
+				}
+			});
+		});
+	});
+}

@@ -1,0 +1,31 @@
+{
+    "name": "texvcjs",
+    "version": "0.3.1-git",
+    "description": "Program compare texvccheck vs texvccheckjs.",
+    "repository": {
+        "type": "git",
+        "url": "git://github.com/TU-Berlin/ntcir-wmc-texvccheck"
+    },
+    "keywords": [
+        "tex",
+        "wikitext",
+        "mediawiki"
+    ],
+    "license": "GPLv2",
+    "bugs": {
+        "url": "https://github.com/TU-Berlin/ntcir-wmc-texvccheck/issues"
+    },
+    "dependencies": {
+        "commander": "~2.5.0",
+	    "kue": "~0.8.9",
+	    "underscore":"~1.7.0",
+	    "texvcjs": "git+http://git@github.com/physikerwelt/texvcjs"
+    },
+    "devDependencies": {
+        "jshint": "~2.5.2",
+        "mocha": "~2.0.1"
+    },
+    "bin": {
+        "texvcjs": "./bin/texvcjsbatch"
+    }
+}
